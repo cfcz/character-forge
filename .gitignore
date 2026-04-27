@@ -14,8 +14,6 @@ wheels/
 
 # 小说原文和生成的数据（体积大，不入库）
 data/examples/
-data/*.json
-data/synthesis/
 
 # 本地日志
 *.log
