@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from character_forge.memory.state_manager import CharacterStateManager
 from character_forge.agent.character_agent import CharacterAgent
-from character_forge.utils.llm import LLMClient
+from character_forge.utils.llm import LLMClient, LocalLLMClient
 
 
 def main():
@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--character", default=None, help="要对话的角色名")
     parser.add_argument("--chapter", type=int, default=None, help="对话的时间点（第几章）")
     parser.add_argument("--provider", default="deepseek")
+    parser.add_argument("--local-model", default=None, help="本地模型路径（SFT 训练后），指定此项则不调用 API")
     parser.add_argument("--show-reasoning", action="store_true", default=True, help="显示推理过程")
     args = parser.parse_args()
 
@@ -41,7 +42,10 @@ def main():
         print("请先运行: python scripts/run_demo.py")
         return
 
-    llm = LLMClient(provider=args.provider)
+    if args.local_model:
+        llm = LocalLLMClient(model_path=args.local_model)
+    else:
+        llm = LLMClient(provider=args.provider)
     manager = CharacterStateManager.load(states_path, llm)
 
     characters = manager.list_characters()

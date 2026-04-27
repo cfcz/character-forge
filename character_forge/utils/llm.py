@@ -1,9 +1,81 @@
-"""LLM 调用封装 — 支持 DeepSeek / Qwen / OpenAI 兼容接口"""
+"""LLM 调用封装 — 支持 DeepSeek / Qwen / OpenAI 兼容接口，以及本地模型"""
 
 import json
 import os
 import re
 from openai import OpenAI
+
+
+class LocalLLMClient:
+    """加载本地合并好的模型（SFT 训练后），接口和 LLMClient 一致"""
+
+    def __init__(self, model_path: str, device: str = "auto"):
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            import torch
+        except ImportError:
+            raise ImportError("请先安装: pip install transformers torch")
+
+        print(f"📦 加载本地模型: {model_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True
+        )
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype="auto",
+            device_map=device,
+            trust_remote_code=True,
+        )
+        self.model.eval()
+        print("✅ 模型加载完成")
+
+    def generate(
+        self,
+        prompt: str,
+        system: str = "你是一个专业的文学分析助手。",
+        temperature: float = 0.3,
+        max_tokens: int = 512,
+        **kwargs,  # 忽略 API 专有参数
+    ) -> str:
+        import torch
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=max(temperature, 0.01),
+                do_sample=temperature > 0.01,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        response = self.tokenizer.decode(
+            outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True
+        )
+        return response.strip()
+
+    def generate_json(self, prompt: str, **kwargs) -> dict:
+        """本地模型不保证 JSON 输出，加 fallback 解析"""
+        raw = self.generate(prompt, **{k: v for k, v in kwargs.items()
+                                       if k in ("system", "temperature", "max_tokens")})
+        json_match = re.search(r"```json\s*(.*?)\s*```", raw, re.DOTALL)
+        if json_match:
+            raw = json_match.group(1)
+        else:
+            positions = [p for p in (raw.find("{"), raw.find("[")) if p >= 0]
+            if positions:
+                raw = raw[min(positions):]
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
 
 
 class LLMClient:
