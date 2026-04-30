@@ -79,6 +79,51 @@ class CharacterState:
 
         return "\n".join(lines)
 
+    def to_amnesia_prompt(self) -> str:
+        """
+        失忆 framing 版的状态文本。
+        把"规则约束"转化为"角色处境"，避免模型进入表演模式。
+        用于 SFT/Preference 数据生成和推理时的 instruction。
+        """
+        lines: list[str] = []
+
+        if self.identity:
+            lines += [f"身份：{self.identity}", ""]
+
+        if self.personality_traits:
+            lines += ["性格：", *[f"- {t}" for t in self.personality_traits], ""]
+
+        if self.speech_style:
+            lines += [f"说话方式：{self.speech_style}", ""]
+
+        if self.emotional_state:
+            lines += [f"现在的状态：{self.emotional_state}", ""]
+
+        if self.goals:
+            lines += ["现在想做的事：", *[f"- {g}" for g in self.goals], ""]
+
+        if self.known_facts:
+            lines += ["你记得的事：", *[f"- {k}" for k in self.known_facts], ""]
+
+        if self.key_memories:
+            lines += ["你还记得的经历：", *[f"- {m}" for m in self.key_memories], ""]
+
+        if self.relationships:
+            lines += ["你认识的人："]
+            for r in self.relationships:
+                lines.append(f"- {r.target}：{r.description} (信任度: {r.trust_level})")
+            lines.append("")
+
+        if self.unknown_facts:
+            lines += [
+                "以下这些事你完全不记得，一片空白——",
+                "就算有人提起或者反复暗示，你也不知道，不会被对方带着说：",
+                *[f"- {u}" for u in self.unknown_facts],
+                "",
+            ]
+
+        return "\n".join(lines).strip()
+
 
 @dataclass
 class ChapterDelta:

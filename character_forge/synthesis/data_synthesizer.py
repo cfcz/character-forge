@@ -76,6 +76,7 @@ SFT_QUESTIONS_PROMPT = """\
 4. 问题要有变化：事实追问、观点追问、情绪追问、关系追问、计划追问可以混合
 5. 问题应当能诱发角色说出"像自己"的回答，而不是解释世界观
 6. 不要直接要求角色泄露未知信息
+7. 问题必须用现代普通话口语；禁止文言文、小说世界特有的称谓/武功名/官职名等背景词汇；如需表达相同意思，请换成现代用语
 
 只输出 JSON 数组，例如：["问题1", "问题2", "问题3"]
 """
@@ -91,12 +92,25 @@ SFT_QUESTIONS_BY_INTENT_PROMPT = """\
 
 要求：
 1. 用户此刻正在对角色"{name}"本人说话，问题里的"你/您"只能指"{name}"
-2. 可以提到其他角色，但只能问"{name}"怎么看、怎么想、怎么经历，不能把其他角色当成被提问者
+2. 禁止生成以其他角色名开头或以其他角色名为主语的问题，例如禁止"泰勒认为……""郭靖会不会……"这类句式
 3. 问题要像正常聊天，不要写成角色回答口吻，不要写成旁白
 4. 不要出现"..."、"……"、括号动作
 5. 不要用固定句式重复提问，尽量自然
+6. 若意图类型为【日常闲聊】【打招呼问候】【情绪陪伴】，问题不需要依赖任何情节，根据角色性格即可提出
+7. 问题必须用现代普通话口语；禁止文言文、小说世界特有的称谓/武功名/官职名等背景词汇；如需表达相同意思，请换成现代用语
 
 只输出 JSON 数组，例如：["问题1", "问题2"]
+"""
+
+DIALOGUE_SINGLE_VALIDATE_PROMPT = """\
+请判断：以下这句台词的说话人是否是"{name}"？
+
+台词：{quote}
+
+上下文（台词在原文中的前后内容）：
+{context}
+
+请只回答"是"或"否"，不要输出其他内容。
 """
 
 INDUCING_QUESTIONS_PROMPT = """\
@@ -137,8 +151,10 @@ SFT_ANSWER_PROMPT = """\
 ❌ 禁止：
 - 用"这问题真有意思""我内心深处……""正如你所知道的"开头
 - 先反问再自答（"怎么说呢？这要从……说起"）
-- 结尾加感悟总结
+- 结尾加感悟总结或反问（"你明白吗？""不是吗？""难道不是……？"）
 - 原样复制 few-shot 里的句子
+- 使用"不是……而是……"这类解释性句式
+- 将 few-shot 里同一个语气词/口头禅在一段回答中重复超过一次
 """
 
 PREFERENCE_CHOSEN_PROMPT = """\
@@ -156,8 +172,11 @@ PREFERENCE_CHOSEN_PROMPT = """\
 ## 回复要求
 - 只能依据已知信息回答，绝不能提及或暗示未知信息
 - 如果问题触碰边界，保持角色口吻，自然收缩到自己能确认的范围
-- 句长、语气、用词贴近上方台词示例
-- 不要括号动作、神态描写、心理描写、舞台说明
+- 语气、用词应当严格贴近上方台词示例，优先模仿台词示例的语言风格，尽可能与台词示例的风格完全一致
+- 不允许输出括号动作、神态描写、心理描写、舞台说明
+- 在没有原著台词示例参考的情况下，不允许使用特定语气词、不常见标点符号、反问等具有强烈个人风格色彩的语言
+- 在没有原著台词示例参考的情况下，不允许展现出常用比喻、补充说明、诗意表达等具有强烈个人风格色彩的语言
+- 句长和回答格式应该与原著台词的范围示例保持严格相似
 - 只输出角色回答
 """
 
@@ -263,12 +282,32 @@ def _has_other_speaker_evidence(name: str, left: str, right: str) -> bool:
     return False
 
 
-def _extract_dialogues_by_speaker(name: str, text: str, max_lines: int) -> list[str]:
+def _get_paragraph_context(text: str, quote: str, window_paras: int = 1) -> str:
+    """返回包含 quote 首 15 字的段落及前后 window_paras 段，作为 LLM 判断上下文"""
+    key = quote[:15]
+    paragraphs = text.split('\n')
+    for i, para in enumerate(paragraphs):
+        if key in para:
+            start = max(0, i - window_paras)
+            end = min(len(paragraphs), i + window_paras + 1)
+            return '\n'.join(paragraphs[start:end])
+    return ""
+
+
+def _extract_dialogues_by_speaker(
+    name: str, text: str, max_lines: int
+) -> tuple[list[str], list[str]]:
     """
-    严格抽取：只保留有明确"{name}+说话动词"证据的引号内容。
+    从文本中抽取台词，返回两个列表：
+    - strict_lines : 有明确 “{name}+说话动词” 证据的引号内容
+    - ambiguous_lines : 无任何说话人明确归属的引号（候选，需 LLM 验证）
+    原有”只保留 strict”的策略会在第三人称代词叙述时大量漏抽，
+    改为将无归属引号也收集起来交 LLM 判断。
     """
-    lines: list[str] = []
-    for m in re.finditer(r"“([^”]{{2,160}})”", text):
+    strict_lines: list[str] = []
+    ambiguous_lines: list[str] = []
+
+    for m in re.finditer("\u201c([^\u201d]{2,160})\u201d", text):
         quote = _clean_dialogue_line(m.group(1).strip())
         if len(quote) < 3:
             continue
@@ -276,21 +315,23 @@ def _extract_dialogues_by_speaker(name: str, text: str, max_lines: int) -> list[
         right = text[m.end():min(len(text), m.end() + 90)]
 
         if _has_target_speaker_evidence(name, left, right):
-            lines.append(quote)
-            continue
+            strict_lines.append(quote)
+        elif not _has_other_speaker_evidence(name, left, right):
+            # 无任何明确说话人归属 → 加入候选，交 LLM 逐条验证
+            ambiguous_lines.append(quote)
+        # 有明确其他说话人证据 → 直接丢弃，不进候选
 
-        # 明确检测到"其他人说"，并且没有目标说话证据，直接丢弃
-        if _has_other_speaker_evidence(name, left, right):
-            continue
-
-    return _dedupe_keep_order(lines)[:max_lines]
+    return (
+        _dedupe_keep_order(strict_lines)[:max_lines],
+        _dedupe_keep_order(ambiguous_lines)[:max_lines * 2],
+    )
 
 
 def _line_has_target_speaker_support(name: str, line: str, text: str) -> bool:
     """
     校验某条台词是否能在原文引号中找到，且具备目标说话人证据。
     """
-    for m in re.finditer(r"“([^”]{{2,200}})”", text):
+    for m in re.finditer("\u201c([^\u201d]{2,200})\u201d", text):
         quote = _clean_dialogue_line(m.group(1).strip())
         if not quote:
             continue
@@ -309,7 +350,7 @@ def _heuristic_extract_dialogues(name: str, text: str, max_lines: int) -> str:
     从中文引号里抓对白，并要求角色名出现在引号前后邻近上下文中。
     """
     lines: list[str] = []
-    for m in re.finditer(r"“([^”]{{2,120}})”", text):
+    for m in re.finditer("\u201c([^\u201d]{2,120})\u201d", text):
         quote = m.group(1).strip()
         left = text[max(0, m.start() - 40):m.start()]
         right = text[m.end():min(len(text), m.end() + 24)]
@@ -548,11 +589,22 @@ class DataSynthesizer:
 
     def _build_sft_intent_plan(self, chapter: int) -> list[tuple[str, str, int]]:
         intents: list[tuple[str, str]] = [
-            ("事实追问", "围绕已知事实或关键记忆，请角色补充细节、核对认知"),
-            ("情绪追问", "围绕当前情绪或压力体验，问角色当下心理状态"),
-            ("关系追问", "围绕与其他人物的关系变化，问角色态度和看法"),
-            ("观点追问", "围绕事件判断或价值倾向，问角色如何理解当前局势"),
-            ("行动追问", "围绕当前目标与下一步行动，问角色接下来打算"),
+            # ── 情节驱动类（需要角色状态作为依据） ──────────────────────
+            ("事实追问",   "围绕已知事实或关键记忆，请角色补充细节、核对认知"),
+            ("情绪追问",   "围绕当前情绪或压力体验，问角色当下心理状态"),
+            ("关系追问",   "围绕与其他人物的关系变化，问角色态度和看法"),
+            ("观点追问",   "围绕事件判断或价值倾向，问角色如何理解当前局势"),
+            ("行动追问",   "围绕当前目标与下一步行动，问角色接下来打算"),
+            # ── 日常类（不依赖具体情节，根据性格即可回答） ──────────────
+            ("日常闲聊",
+             "不依赖本章节情节，围绕角色日常喜好、生活习惯、兴趣、口味等提问；"
+             "问题无需了解任何剧情背景即可提出和回答"),
+            ("打招呼问候",
+             "模拟用户第一次接触角色时的寒暄，或问候角色近况；"
+             "角色需要简单介绍自己或回应问候，不涉及具体情节事件"),
+            ("情绪陪伴",
+             "用户向角色表达自己的心情或困惑，希望角色给出回应或陪伴；"
+             "角色以自身性格作出反应，不必引用任何具体情节"),
         ]
         total = max(1, self.sft_questions_per_slice)
         counts = [0] * len(intents)
@@ -589,9 +641,25 @@ class DataSynthesizer:
             # 常见称谓开头但不是当前角色，通常是把别人当成了被提问对象
             if re.search(r'(老师|教授|将军|博士|警官|先生|女士|同学)$', clause):
                 return True
+
+        # 检查全句是否有其他已知角色名作主语（角色名+动词 结构）
+        # 例如："泰勒认为……""郭靖会不会……" → 被提问者变成了第三方角色
+        known_names = {r.target for r in state.relationships if getattr(r, "target", "")}
+        if known_names:
+            name_alts = "|".join(re.escape(n) for n in known_names if len(n) >= 2)
+            if name_alts:
+                subject_verb_pat = (
+                    rf"({name_alts})[^，。！？\n]{{0,6}}"
+                    r"(认为|会不会|会|打算|说|觉得|是否|能不能|有没有|为什么|怎么|是不是|有没有)"
+                )
+                if re.search(subject_verb_pat, q):
+                    return True
+
         return False
 
-    def _is_bad_generated_answer(self, text: str) -> bool:
+    def _is_bad_generated_answer(
+        self, text: str, state: CharacterState | None = None
+    ) -> bool:
         t = text.strip()
         if not t or len(t) < 2:
             return True
@@ -603,16 +671,41 @@ class DataSynthesizer:
             return True
         if re.search(r'(作为|身为).{0,4}(AI|语言模型)', t):
             return True
+        # "不是X而是Y" AI 解释性结构
+        if re.search(r'不是.{1,20}而是', t):
+            return True
+        # 结尾反问/套话（区别于正常疑问句）
+        if re.search(r'(不是吗|难道.{0,10}[？?]|你说呢\s*[？?]|对吗\s*[？?]|不对吗\s*[？?]|你明白吗\s*[？?])\s*$', t):
+            return True
+        # ── 幻觉检测：自传性个人经历叙述 ────────────────────────────────
+        # 模型在日常闲聊问题上容易编造角色从未经历过的童年/家庭故事。
+        # 检测到以下自传性模式时，再对照 state 的已知信息进行验证。
+        autobio_patterns = [
+            r'从.{0,4}(岁|年|小时候|童年).{0,10}(开始|起)',   # "从七岁开始"
+            r'(父亲|母亲|爸爸|妈妈|家人|祖父|外婆).{0,10}(给我|教我|带我|告诉我)',
+            r'(小时候|童年时?|年幼时?).{0,20}(记得|记忆|印象)',
+        ]
+        if state is not None and any(re.search(p, t) for p in autobio_patterns):
+            # 已知信息/关键记忆里是否有相关的个人历史依据
+            known_text = ' '.join(state.known_facts + state.key_memories)
+            personal_keywords = ['父亲', '母亲', '童年', '小时候', '家人', '岁时', '年幼', '幼年']
+            if not any(kw in known_text for kw in personal_keywords):
+                return True  # 没有依据 → 视为幻觉编造，重新生成
         return False
 
-    def _generate_answer_with_retry(self, prompt: str, base_temperature: float) -> str:
+    def _generate_answer_with_retry(
+        self,
+        prompt: str,
+        base_temperature: float,
+        state: CharacterState | None = None,
+    ) -> str:
         last = ""
         for i in range(self.regen_retries + 1):
             temp = min(base_temperature + 0.08 * i, 0.75)
             raw = self.llm.generate(prompt, temperature=temp).strip()
             cleaned = _clean_generated_answer(raw)
             last = cleaned
-            if not self._is_bad_generated_answer(cleaned):
+            if not self._is_bad_generated_answer(cleaned, state):
                 return cleaned
         return last
 
@@ -657,42 +750,41 @@ class DataSynthesizer:
 
         combined = "\n\n---\n\n".join(content_parts)
 
-        # 先走严格 speaker 规则，避免把"别人对{name}说的话"抽进 few-shot
-        strict_lines = _extract_dialogues_by_speaker(name, combined, self.dialogue_examples)
+        # ── 第一步：正则抽取 ────────────────────────────────────────────────
+        # strict  = 有明确"{name}+说话动词"证据
+        # ambiguous = 无任何说话人归属（代词叙述或省略主语的对话）
+        strict_lines, ambiguous_lines = _extract_dialogues_by_speaker(
+            name, combined, self.dialogue_examples
+        )
         if len(strict_lines) >= min(4, self.dialogue_examples):
             result = "\n".join(strict_lines[:self.dialogue_examples])
             self._dialogue_cache[cache_key] = result
             return result
 
-        prompt = DIALOGUE_EXTRACT_PROMPT.format(
-            name=name,
-            chapter_content=combined,
-            n_examples=self.dialogue_examples,
-        )
-
+        # ── 第二步：LLM 生成候选（与 ambiguous 合并后逐条验证）───────────
+        llm_lines: list[str] = []
         try:
+            prompt = DIALOGUE_EXTRACT_PROMPT.format(
+                name=name,
+                chapter_content=combined,
+                n_examples=self.dialogue_examples,
+            )
             raw = self.llm.generate(prompt, temperature=0.1).strip()
-            if raw == "无" or not raw:
-                llm_lines: list[str] = []
-            else:
+            if raw and raw != "无":
                 cleaned = _clean_dialogues(raw, max_lines=self.dialogue_examples * 2)
-                llm_lines = [line.strip() for line in cleaned.splitlines() if line.strip()] if cleaned else []
-
-            # 用 LLM 验证步骤替代纯正则校验，处理代词归属等复杂情况
-            validated_llm = self._validate_dialogues_with_llm(name, llm_lines, combined)
-
-            merged = _dedupe_keep_order(strict_lines + validated_llm)[:self.dialogue_examples]
-            if merged:
-                result = "\n".join(merged)
-            else:
-                # 不再退回"名字邻近"启发式，避免错把别人台词归到当前角色
-                result = fallback
+                llm_lines = [l.strip() for l in cleaned.splitlines() if l.strip()] if cleaned else []
         except Exception as e:
-            print(f"   ⚠️ 台词提取失败: {e}")
-            if strict_lines:
-                result = "\n".join(strict_lines[:self.dialogue_examples])
-            else:
-                result = fallback
+            print(f"   ⚠️ LLM 台词生成失败: {e}")
+
+        # ambiguous 候选 + LLM 生成候选合并，逐条 LLM 验证（用段落上下文）
+        candidates = _dedupe_keep_order(ambiguous_lines + llm_lines)
+        try:
+            validated = self._validate_dialogues_with_llm(name, candidates, combined)
+            merged = _dedupe_keep_order(strict_lines + validated)[:self.dialogue_examples]
+            result = "\n".join(merged) if merged else fallback
+        except Exception as e:
+            print(f"   ⚠️ 台词验证失败: {e}")
+            result = "\n".join(strict_lines[:self.dialogue_examples]) if strict_lines else fallback
 
         self._dialogue_cache[cache_key] = result
         return result
@@ -704,54 +796,70 @@ class DataSynthesizer:
         chapter_content: str,
     ) -> list[str]:
         """
-        使用 LLM 验证候选台词是否真的属于目标角色，处理代词归属等复杂情况。
-        只有当候选列表非空时才调用 LLM。
+        使用 LLM 逐条验证候选台词是否属于目标角色。
+        每条台词都获得独立的上下文窗口，解决批量验证时代词归属漏判的问题。
+        流程：正则快速过滤有明确他者证据的 → LLM 逐条验证剩余候选。
         """
         if not candidates:
             return []
 
-        # 先用正则快速过滤掉明确不属于目标角色的（速度快，避免不必要的 LLM 调用）
-        # 只保留"无明确其他说话人证据"的，再交给 LLM 做最终判断
-        candidates_no_other = []
+        content_for_validate = chapter_content[:8000]
+        validated: list[str] = []
+
         for line in candidates:
-            # 在原文里找到这行台词的位置，检查是否有其他说话人证据
+            # ── Step 1: 正则快速判断是否有明确其他说话人证据 ──────────
             found_other = False
-            for m in re.finditer(r"“([^”]{{2,200}})”", chapter_content):
+            context_window = ""
+
+            for m in re.finditer(
+                "\u201c([^\u201d]{2,200})\u201d", content_for_validate
+            ):
                 quote = _clean_dialogue_line(m.group(1).strip())
                 if not quote:
                     continue
                 if line not in quote and quote not in line:
                     continue
-                left = chapter_content[max(0, m.start() - 90):m.start()]
-                right = chapter_content[m.end():min(len(chapter_content), m.end() + 90)]
+
+                left = content_for_validate[max(0, m.start() - 90): m.start()]
+                right = content_for_validate[m.end(): min(len(content_for_validate), m.end() + 90)]
+
                 if _has_other_speaker_evidence(name, left, right):
                     found_other = True
                     break
-            if not found_other:
-                candidates_no_other.append(line)
 
-        if not candidates_no_other:
-            return []
+                # 优先用段落级上下文（含前后行，更准确），退化时用 ±150 字
+                context_window = _get_paragraph_context(content_for_validate, line)
+                if not context_window:
+                    start = max(0, m.start() - 150)
+                    end = min(len(content_for_validate), m.end() + 150)
+                    context_window = content_for_validate[start:end]
 
-        # 截取章节内容（避免 prompt 过长）
-        content_for_validate = chapter_content[:6000]
+            if found_other:
+                continue  # 正则已确认不是目标角色，跳过
 
-        validate_prompt = DIALOGUE_VALIDATE_PROMPT.format(
-            name=name,
-            dialogue_list=json.dumps(candidates_no_other, ensure_ascii=False),
-            chapter_content=content_for_validate,
-        )
+            # ── Step 2: 在原文找不到对应引号 → 保留，不做 LLM 验证 ──
+            if not context_window:
+                validated.append(line)
+                continue
 
-        try:
-            result = self.llm.generate_json(validate_prompt, temperature=0.0)
-            if isinstance(result, list):
-                validated = [str(line).strip() for line in result if isinstance(line, str) and str(line).strip()]
-                return validated
-        except Exception as e:
-            print(f"   ⚠️ 台词验证失败，保留未过滤候选: {e}")
-            return candidates_no_other
+            # ── Step 3: LLM 逐条验证（有独立上下文窗口）──────────────
+            prompt = DIALOGUE_SINGLE_VALIDATE_PROMPT.format(
+                name=name,
+                quote=line,
+                context=context_window,
+            )
+            try:
+                response = self.llm.generate(
+                    prompt, temperature=0.0, max_tokens=16
+                ).strip()
+                # 只要回答里出现"是"且没有"否"，就认为通过
+                if "是" in response and "否" not in response:
+                    validated.append(line)
+            except Exception as e:
+                print(f"   ⚠️ 单条台词验证失败，保留候选: {e}")
+                validated.append(line)  # 验证失败时保留，不过滤
 
-        return candidates_no_other
+        return validated
 
     def _generate_sft_questions(self, name: str, state: CharacterState, chapter: int) -> list[str]:
         wanted = max(1, self.sft_questions_per_slice)
@@ -845,7 +953,7 @@ class DataSynthesizer:
             character_state=state.to_prompt(),
             question=question,
         )
-        return self._generate_answer_with_retry(prompt, base_temperature=0.35)
+        return self._generate_answer_with_retry(prompt, base_temperature=0.35, state=state)
 
     def _generate_preference_chosen(
         self,
@@ -862,7 +970,7 @@ class DataSynthesizer:
             character_state=state.to_prompt(),
             question=question,
         )
-        return self._generate_answer_with_retry(prompt, base_temperature=0.35)
+        return self._generate_answer_with_retry(prompt, base_temperature=0.35, state=state)
 
     def _generate_preference_rejected(
         self,
@@ -881,7 +989,7 @@ class DataSynthesizer:
             question=question,
             unknown_fact=unknown_fact,
         )
-        return self._generate_answer_with_retry(prompt, base_temperature=0.6)
+        return self._generate_answer_with_retry(prompt, base_temperature=0.6, state=state)
 
 
 # ── 输出格式化 ────────────────────────────────────────────────────────────────

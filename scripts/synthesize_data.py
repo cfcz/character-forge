@@ -117,7 +117,7 @@ def main():
 
     parser.add_argument("--mode", choices=["sft", "preference", "both"], default="both", help="生成哪种数据（默认 both）")
     parser.add_argument("--characters", nargs="+", default=None, help="只处理这些角色（默认全部）")
-    parser.add_argument("--top-n", type=int, default=None, help="按角色丰富度自动选取前 N 个角色（与 --characters 互斥）")
+    parser.add_argument("--top-n", type=int, default=20, help="按角色丰富度自动选取前 N 个角色（与 --characters 互斥）")
     parser.add_argument("--questions-per-fact", type=int, default=2, help="每条 unknown_fact 生成几个问题（默认 2）")
     parser.add_argument("--sft-questions-per-slice", type=int, default=4, help="每个章节切片生成几个 SFT 问题（默认 4）")
     parser.add_argument("--chapter-stride", type=int, default=5, help="每隔几章取一个状态切片（默认 5）")
