@@ -53,9 +53,17 @@ EXTRACTION_PROMPT = """\
 注意：
 - 只提取重要角色的变化，路人不需要提取
 - new_facts_learned：记录角色在本章亲眼/亲耳获知的信息
-- unknown_facts_updated：记录本章揭示的、该角色尚不知情的重要信息（例如：别人对他的秘密计划、他被隐瞒的身世、幕后真相等）。如果没有则填 []
+- unknown_facts_updated：记录本章揭示的、该角色尚不知情的重要信息（例如：别人对他的秘密计划、他被隐瞒的身世、幕后真相等）。这个字段必须出现在每个 character_changes 条目中；如果没有则填 []
 - 如果某角色在本章没有变化，就不要把ta放在 character_changes 里
 - new_characters 只包含首次出场的角色
+"""
+
+SCHEMA_RETRY_SUFFIX = """\
+
+上一次输出缺少必需字段。请重新输出完整 JSON，并确保：
+- 每个 character_changes 条目都包含 unknown_facts_updated 字段
+- unknown_facts_updated 必须是数组；没有未知信息时写 []
+- 不要省略任何 schema 字段
 """
 
 
@@ -95,7 +103,65 @@ class ChapterExtractor:
         )
 
         result = self.llm.generate_json(prompt)
+        result, stats = self._normalize_extraction(result)
+
+        if self._should_retry_for_missing_unknown(stats):
+            retry_result = self.llm.generate_json(prompt + SCHEMA_RETRY_SUFFIX)
+            retry_result, retry_stats = self._normalize_extraction(retry_result)
+            if retry_stats["missing_unknown_fields"] < stats["missing_unknown_fields"]:
+                result, stats = retry_result, retry_stats
+
+        result["_validation"] = stats
         return result
+
+    def _normalize_extraction(self, result: dict) -> tuple[dict, dict]:
+        """补齐 LLM 可能省略的字段，并返回 schema 质量统计。"""
+        if not isinstance(result, dict):
+            result = {}
+
+        result.setdefault("chapter_summary", "")
+        result.setdefault("characters_appeared", [])
+        result.setdefault("key_events", [])
+        result.setdefault("character_changes", [])
+        result.setdefault("new_characters", [])
+
+        changes = result.get("character_changes")
+        if not isinstance(changes, list):
+            changes = []
+            result["character_changes"] = changes
+
+        missing_unknown_fields = 0
+        unknown_fact_count = 0
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+
+            if "unknown_facts_updated" not in change:
+                missing_unknown_fields += 1
+                change["unknown_facts_updated"] = []
+            elif not isinstance(change["unknown_facts_updated"], list):
+                change["unknown_facts_updated"] = []
+
+            change.setdefault("new_facts_learned", [])
+            change.setdefault("relationship_changes", [])
+            change.setdefault("emotional_shift", None)
+            change.setdefault("key_event", "")
+            change.setdefault("personality_development", None)
+
+            unknown_fact_count += len(change["unknown_facts_updated"])
+
+        stats = {
+            "character_changes": len(changes),
+            "missing_unknown_fields": missing_unknown_fields,
+            "unknown_facts_updated": unknown_fact_count,
+        }
+        return result, stats
+
+    def _should_retry_for_missing_unknown(self, stats: dict) -> bool:
+        return (
+            stats["character_changes"] > 0
+            and stats["missing_unknown_fields"] == stats["character_changes"]
+        )
 
     def _truncate_if_needed(self, text: str, max_chars: int = 8000) -> str:
         if len(text) <= max_chars:

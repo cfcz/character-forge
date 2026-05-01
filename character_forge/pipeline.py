@@ -93,8 +93,12 @@ class NovelProcessor:
                 n_chars = len(extraction.get("characters_appeared", []))
                 n_changes = len(extraction.get("character_changes", []))
                 n_new = len(extraction.get("new_characters", []))
+                validation = extraction.get("_validation", {})
+                n_unknown = validation.get("unknown_facts_updated", 0)
+                n_missing_unknown = validation.get("missing_unknown_fields", 0)
                 print(f"   ✅ {elapsed:.1f}s | "
-                      f"出场{n_chars}人 | 变化{n_changes}条 | 新角色{n_new}个")
+                      f"出场{n_chars}人 | 变化{n_changes}条 | 新角色{n_new}个 | "
+                      f"unknown新增{n_unknown}条 | unknown字段缺失{n_missing_unknown}条")
 
             # 每章处理完立即保存 checkpoint
             if checkpoint_path:
