@@ -31,6 +31,7 @@ import json
 import random
 import sys
 from pathlib import Path
+import re
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -189,11 +190,49 @@ def evaluate_boundary(samples: list[dict], model_path: str, judge: LLMClient, n:
     print(f"\n📊 边界保持率: {boundary_rate:.1%}  ({len(valid)-leaked_count}/{len(valid)} 未泄露)")
     return {"boundary_rate": boundary_rate, "details": results}
 
+def check_hard_rules(answer: str, is_ancient_setting: bool = False) -> bool:
+    """
+    硬性规则检查：使用正则短语和位置锚点，精准拦截 AI 套话，降低误伤率。
+    返回 False 表示触发硬规则（格式崩坏或出现严重 AI 腔）。
+    """
+    # 规则 1：绝对的 AI 身份自曝（无论出现在哪都 100% 拦截）
+    ai_identity_pattern = r"(作为(一个)?(AI|人工智能|语言模型)|我(只是|是)(一个)?(AI|人工智能|语言模型))"
+    if re.search(ai_identity_pattern, answer, re.IGNORECASE):
+        return False
+
+    # 规则 2：典型的开头拒绝套话（使用 ^ 限制在句首，避免误伤正常的对话中途说“抱歉”）
+    refusal_start_pattern = r"^(抱歉|对不起|很抱歉)[，。！\s]*(我无法|我不能|作为|这是一个)"
+    if re.search(refusal_start_pattern, answer):
+        return False
+
+    # 规则 3：典型的结尾助手套话（使用 $ 限制在句尾，大模型最爱在最后加一句服务语）
+    assistant_end_pattern = r"(需要我(帮忙|做些什么)吗|随时提问|很高兴为(您|你)解答|如果(您|你)有任何问题|我乐意效劳)[。？！\?!\s]*$"
+    if re.search(assistant_end_pattern, answer):
+        return False
+
+    # 规则 4：大模型常见的免责声明组合
+    disclaimer_pattern = r"(请注意[，。]这只是|我无法(为(您|你))?提供|这超出了我的(能力|知识)范围)"
+    if re.search(disclaimer_pattern, answer):
+        return False
+
+    # 规则 5：兜底有效性校验
+    # 至少得包含一个中文字符，否则说明模型生成完全崩溃（比如全是乱码或空白）
+    if not re.search(r'[\u4e00-\u9fa5]', answer):
+        return False
+
+    # 如果需要严格校验结构（比如必须有 *动作* ），可以取消下面的注释
+    # if not re.match(r'^(\*.*?\*\s*)?.*$', answer):
+    #     return False
+
+    return True
+
 
 def evaluate_style(samples: list[dict], model_path: str, judge: LLMClient, n: int) -> dict:
-    """评测风格相似度"""
+    """评测格式准确率 + 风格相似度"""
     selected = random.sample(samples, min(n, len(samples)))
-    scores = []
+    scores = []          # 所有样本的风格分（格式不过关的记 1 分）
+    style_scores = []    # 仅格式通过样本的风格分（用于纯风格均值）
+    format_pass = 0
 
     print(f"\n🎭 风格评测（共 {len(selected)} 条）")
     for i, sample in enumerate(selected):
@@ -202,6 +241,16 @@ def evaluate_style(samples: list[dict], model_path: str, judge: LLMClient, n: in
         few_shot = _extract_section(instruction, "原著台词示例") or "（无台词示例）"
 
         answer = run_model_inference(model_path, instruction, question)
+
+        # 1. 先进行正则/规则硬拦截
+        if not check_hard_rules(answer):
+            score = 1
+            reason = "规则拦截：包含AI套话或格式严重错误"
+            scores.append(score)
+            print(f"   [{i+1}/{len(selected)}] ❌格式 | 风格: {score}/5 | {reason}")
+            continue  # 直接跳过 LLM 裁判，省钱！
+
+        format_pass += 1
 
         judge_prompt = STYLE_JUDGE_PROMPT.format(
             few_shot=few_shot,
@@ -216,11 +265,27 @@ def evaluate_style(samples: list[dict], model_path: str, judge: LLMClient, n: in
             reason = "judge error"
 
         scores.append(score)
-        print(f"   [{i+1}/{len(selected)}] 风格得分: {score}/5 | {reason}")
+        style_scores.append(score)
+        print(f"   [{i+1}/{len(selected)}] ✅格式 | 风格: {score}/5 | {reason}")
 
-    avg_score = sum(scores) / len(scores) if scores else 0
-    print(f"\n📊 平均风格得分: {avg_score:.2f}/5.0")
-    return {"avg_style_score": avg_score, "scores": scores}
+    total = len(selected)
+    format_accuracy = format_pass / total if total else 0
+    avg_style_score = sum(style_scores) / len(style_scores) if style_scores else 0
+    # 综合得分：格式准确率 × 归一化风格分（风格满分5→1.0）
+    combined_score = format_accuracy * (avg_style_score / 5.0)
+
+    print(f"\n📊 格式准确率: {format_accuracy:.1%}  ({format_pass}/{total} 通过)")
+    print(f"📊 风格得分:   {avg_style_score:.2f}/5.0  （仅格式通过样本）")
+    print(f"📊 综合得分:   {combined_score:.3f}  （格式准确率 × 风格归一化）")
+
+    return {
+        "format_accuracy": format_accuracy,
+        "avg_style_score": avg_style_score,
+        "combined_score": combined_score,
+        "format_pass": format_pass,
+        "total": total,
+        "scores": scores,
+    }
 
 
 def _extract_field(text: str, field: str) -> str:
@@ -272,7 +337,10 @@ def main():
     if "boundary" in all_results:
         print(f"  边界保持率: {all_results['boundary']['boundary_rate']:.1%}")
     if "style" in all_results:
-        print(f"  风格得分:   {all_results['style']['avg_style_score']:.2f} / 5.0")
+        s = all_results["style"]
+        print(f"  格式准确率: {s['format_accuracy']:.1%}  ({s['format_pass']}/{s['total']})")
+        print(f"  风格得分:   {s['avg_style_score']:.2f} / 5.0")
+        print(f"  综合得分:   {s['combined_score']:.3f}")
 
     if args.output:
         Path(args.output).write_text(json.dumps(all_results, ensure_ascii=False, indent=2))
