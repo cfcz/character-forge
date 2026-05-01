@@ -195,37 +195,43 @@ def check_hard_rules(answer: str, is_ancient_setting: bool = False) -> bool:
     硬性规则检查：使用正则短语和位置锚点，精准拦截 AI 套话，降低误伤率。
     返回 False 表示触发硬规则（格式崩坏或出现严重 AI 腔）。
     """
-    # 规则 1：绝对的 AI 身份自曝（无论出现在哪都 100% 拦截）
+    # 规则 1：绝对的 AI 身份自曝
     ai_identity_pattern = r"(作为(一个)?(AI|人工智能|语言模型)|我(只是|是)(一个)?(AI|人工智能|语言模型))"
     if re.search(ai_identity_pattern, answer, re.IGNORECASE):
         return False
 
-    # 规则 2：典型的开头拒绝套话（使用 ^ 限制在句首，避免误伤正常的对话中途说“抱歉”）
-    refusal_start_pattern = r"^(抱歉|对不起|很抱歉)[，。！\s]*(我无法|我不能|作为|这是一个)"
+    # 规则 2：典型的开头拒绝套话
+    refusal_start_pattern = r"^(抱歉|对不起|很抱歉)[\uff0c。！\s]*(我无法|我不能|作为|这是一个)"
     if re.search(refusal_start_pattern, answer):
         return False
 
-    # 规则 3：典型的结尾助手套话（使用 $ 限制在句尾，大模型最爱在最后加一句服务语）
-    assistant_end_pattern = r"(需要我(帮忙|做些什么)吗|随时提问|很高兴为(您|你)解答|如果(您|你)有任何问题|我乐意效劳)[。？！\?!\s]*$"
+    # 规则 3：典型的结尾助手套话
+    assistant_end_pattern = r"(需要我(帮忙|做些什么)吗|随时提问|很高兴为(您|你)解答|如果(您|你)有任何问题|我乐意效劳)[\u3002\uff1f\uff01\?!\s]*$"
     if re.search(assistant_end_pattern, answer):
         return False
 
-    # 规则 4：大模型常见的免责声明组合
-    disclaimer_pattern = r"(请注意[，。]这只是|我无法(为(您|你))?提供|这超出了我的(能力|知识)范围)"
+    # 规则 4：无法提供类免责声明（含不以"抱歉"开头的句式）
+    disclaimer_pattern = (
+        r"(请注意[，。]这只是"
+        r"|我无法(为(您|你))?提供"
+        r"|这超出了我的(能力|知识)范围"
+        r"|(无法|不便|不能)(透露|提供|回答|说明)(具体)?(细节|信息|内容|答案|情况)?)"
+    )
     if re.search(disclaimer_pattern, answer):
         return False
 
-    # 规则 5：兜底有效性校验
-    # 至少得包含一个中文字符，否则说明模型生成完全崩溃（比如全是乱码或空白）
-    if not re.search(r'[\u4e00-\u9fa5]', answer):
+    # 规则 5：人称混乱 — 角色扮演必须用第一人称，若回答超过 30 字却完全没有"我"，
+    # 且存在明显的第三人称叙述（他/她 + 动词），判定为旁白模式
+    if len(answer) > 30 and "我" not in answer:
+        third_person_pattern = r"[他她][^们]{0,4}(说|感到|觉得|认为|想|看|做|走|回答|表示)"
+        if re.search(third_person_pattern, answer):
+            return False
+
+    # 规则 6：兜底有效性校验
+    if not re.search(r'[一-龥]', answer):
         return False
 
-    # 如果需要严格校验结构（比如必须有 *动作* ），可以取消下面的注释
-    # if not re.match(r'^(\*.*?\*\s*)?.*$', answer):
-    #     return False
-
     return True
-
 
 def evaluate_style(samples: list[dict], model_path: str, judge: LLMClient, n: int) -> dict:
     """评测格式准确率 + 风格相似度"""
@@ -233,6 +239,7 @@ def evaluate_style(samples: list[dict], model_path: str, judge: LLMClient, n: in
     scores = []          # 所有样本的风格分（格式不过关的记 1 分）
     style_scores = []    # 仅格式通过样本的风格分（用于纯风格均值）
     format_pass = 0
+    details = []         # 每条样本的完整记录
 
     print(f"\n🎭 风格评测（共 {len(selected)} 条）")
     for i, sample in enumerate(selected):
@@ -247,6 +254,7 @@ def evaluate_style(samples: list[dict], model_path: str, judge: LLMClient, n: in
             score = 1
             reason = "规则拦截：包含AI套话或格式严重错误"
             scores.append(score)
+            details.append({"question": question, "answer": answer, "format_pass": False, "score": score, "reason": reason})
             print(f"   [{i+1}/{len(selected)}] ❌格式 | 风格: {score}/5 | {reason}")
             continue  # 直接跳过 LLM 裁判，省钱！
 
@@ -266,6 +274,7 @@ def evaluate_style(samples: list[dict], model_path: str, judge: LLMClient, n: in
 
         scores.append(score)
         style_scores.append(score)
+        details.append({"question": question, "answer": answer, "format_pass": True, "score": score, "reason": reason})
         print(f"   [{i+1}/{len(selected)}] ✅格式 | 风格: {score}/5 | {reason}")
 
     total = len(selected)
@@ -285,6 +294,7 @@ def evaluate_style(samples: list[dict], model_path: str, judge: LLMClient, n: in
         "format_pass": format_pass,
         "total": total,
         "scores": scores,
+        "details": details,
     }
 
 
@@ -296,9 +306,9 @@ def _extract_field(text: str, field: str) -> str:
 
 
 def _extract_section(text: str, section: str) -> str:
-    """从 instruction 文本中提取段落"""
+    """从 instruction 文本中提取段落（section 为 header 的子串即可匹配）"""
     import re
-    m = re.search(rf"###?\s*{section}\s*\n([\s\S]+?)(?=\n###?|\Z)", text)
+    m = re.search(rf"###?\s*[^\n]*{re.escape(section)}[^\n]*\n([\s\S]+?)(?=\n###?|\Z)", text)
     return m.group(1).strip() if m else ""
 
 
