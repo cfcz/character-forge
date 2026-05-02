@@ -136,6 +136,11 @@ def main():
     # ── 1. 加载模型 ───────────────────────────────────────────────────────────
     model, tokenizer = load_merged_model(args.sft_model)
 
+    # trl/transformers 版本兼容：部分 transformers 版本不会在 __init__ 里设置
+    # warnings_issued，但 trl GRPOTrainer 在初始化时会访问它
+    if not hasattr(model, "warnings_issued"):
+        model.warnings_issued = {}
+
     # ── 2. 加载数据 ───────────────────────────────────────────────────────────
     train_dataset = build_dataset(tokenizer, args.train_data)
 
