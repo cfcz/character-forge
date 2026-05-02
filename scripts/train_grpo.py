@@ -126,8 +126,8 @@ def main():
                         help="GRPO 训练数据路径")
     parser.add_argument("--output_dir",  default="/root/output/qwen_grpo",
                         help="输出目录")
-    parser.add_argument("--num_epochs",       type=int,   default=2)
-    parser.add_argument("--num_generations",  type=int,   default=8,
+    parser.add_argument("--num_epochs",       type=int,   default=1)
+    parser.add_argument("--num_generations",  type=int,   default=4,
                         help="每个 prompt 采样的回答数 G（默认 8）")
     parser.add_argument("--learning_rate",    type=float, default=5e-6)
     parser.add_argument("--max_new_tokens",   type=int,   default=256)
@@ -194,10 +194,12 @@ def main():
 
     trainer.train()
 
-    # ── 6. 保存 ───────────────────────────────────────────────────────────────
-    trainer.save_model(args.output_dir)
+    # ── 6. 保存（merge LoRA 后保存完整模型，evaluate.py 可直接加载） ──────────
+    print("\n🔄 合并 GRPO LoRA 并保存完整模型...")
+    merged = trainer.model.merge_and_unload()
+    merged.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print(f"\n✅ 训练完成！模型已保存至 {args.output_dir}")
+    print(f"\n✅ 训练完成！完整模型已保存至 {args.output_dir}")
 
 
 if __name__ == "__main__":
