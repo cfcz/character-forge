@@ -23,7 +23,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 # ── NLI 模型（全局单例，只加载一次）────────────────────────────────────────────
 
-NLI_MODEL_NAME = "IDEA-CCNL/Erlangshen-Roberta-110M-NLI"
+NLI_MODEL_NAME = "/root/models/Erlangshen-Roberta-110M-NLI"
 NLI_ENTAIL_THRESHOLD = 0.7      # 超过此置信度才判定为"蕴含"
 NLI_CONTRADICT_THRESHOLD = 0.7  # 超过此置信度才判定为"矛盾"
 
