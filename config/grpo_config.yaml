@@ -1,0 +1,40 @@
+### Character Forge — GRPO 训练配置
+### 基于 LLaMA-Factory，在 SFT 模型基础上做边界对齐
+
+# ── 模型 ───────────────────────────────────────────────────────────────────────
+model_name_or_path: /root/output/qwen_sft_full   # 用 SFT 训好的模型作为起点
+stage: grpo
+finetuning_type: lora
+
+# LoRA 配置（与 SFT 保持一致）
+lora_rank: 16
+lora_target: all
+
+# ── 数据 ───────────────────────────────────────────────────────────────────────
+dataset: character_grpo              # 对应 data/dataset_info.json 里的配置
+template: qwen
+cutoff_len: 2048
+
+# ── GRPO 专项参数 ───────────────────────────────────────────────────────────────
+reward_funcs:
+  - character_forge.training.reward_function.character_reward_fn
+# 注意：需要确保 /root/character-forge 在 PYTHONPATH 里
+# 运行命令前执行：export PYTHONPATH=/root/character-forge:$PYTHONPATH
+
+num_generations: 8          # 每个 prompt 采样 G=8 条回答
+max_new_tokens: 256         # 生成回答的最大长度
+
+# ── 训练超参 ────────────────────────────────────────────────────────────────────
+output_dir: /root/output/qwen_grpo
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8    # 等效 batch_size=8，和 num_generations 对应
+learning_rate: 5.0e-6             # GRPO 阶段 lr 要比 SFT 小一个量级
+num_train_epochs: 2
+warmup_ratio: 0.05
+lr_scheduler_type: cosine
+fp16: true
+
+# ── 日志与保存 ──────────────────────────────────────────────────────────────────
+logging_steps: 10
+save_steps: 100
+save_total_limit: 3
