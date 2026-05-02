@@ -40,6 +40,7 @@ from character_forge.synthesis.data_synthesizer import (
     to_sft_format,
 )
 from character_forge.utils.llm import LLMClient
+import json
 
 
 def _preview_sft(items):
@@ -177,20 +178,29 @@ def main():
             print(f"\n🚀 开始合成 SFT 数据（dry-run，最多 {args.dry_run} 条）...\n")
         else:
             print("\n🚀 开始合成 SFT 数据...\n")
-        sft_items = synthesizer.synthesize_sft(
-            manager=manager,
-            novel_text=novel_text,
-            characters=selected_characters,
-            max_chapters=args.max_chapters,
-            max_samples=args.dry_run,
-        )
-        if sft_items:
+        sft_path = output_dir / f"{novel_name}_sft.jsonl"
+        sft_path.parent.mkdir(parents=True, exist_ok=True)
+        sft_count = 0
+        first_sft_item = None
+        with open(sft_path, "a", encoding="utf-8") as f:
+            for item in synthesizer.synthesize_sft(
+                manager=manager,
+                novel_text=novel_text,
+                characters=selected_characters,
+                max_chapters=args.max_chapters,
+                max_samples=args.dry_run,
+            ):
+                if first_sft_item is None:
+                    first_sft_item = item
+                for record in to_sft_format([item], manager):
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    f.flush()
+                sft_count += 1
+        if sft_count > 0:
             generated_any = True
-            print(f"\n✅ 共生成 {len(sft_items)} 条 SFT 原始样本")
-            _preview_sft(sft_items)
-            sft_records = to_sft_format(sft_items, manager)
-            sft_path = output_dir / f"{novel_name}_sft.jsonl"
-            save_jsonl(sft_records, sft_path)
+            print(f"\n✅ 共生成 {sft_count} 条 SFT 样本，已写入 {sft_path}")
+            if first_sft_item:
+                _preview_sft([first_sft_item])
         else:
             print("⚠️ 没有生成任何 SFT 样本")
 
@@ -199,20 +209,29 @@ def main():
             print(f"\n🚀 开始合成 Preference 数据（dry-run，最多 {args.dry_run} 条）...\n")
         else:
             print("\n🚀 开始合成 Preference 数据...\n")
-        pref_items = synthesizer.synthesize_preference(
-            manager=manager,
-            novel_text=novel_text,
-            characters=selected_characters,
-            max_chapters=args.max_chapters,
-            max_samples=args.dry_run,
-        )
-        if pref_items:
+        pref_path = output_dir / f"{novel_name}_preference.jsonl"
+        pref_path.parent.mkdir(parents=True, exist_ok=True)
+        pref_count = 0
+        first_pref_item = None
+        with open(pref_path, "a", encoding="utf-8") as f:
+            for item in synthesizer.synthesize_preference(
+                manager=manager,
+                novel_text=novel_text,
+                characters=selected_characters,
+                max_chapters=args.max_chapters,
+                max_samples=args.dry_run,
+            ):
+                if first_pref_item is None:
+                    first_pref_item = item
+                for record in to_preference_format([item], manager):
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    f.flush()
+                pref_count += 1
+        if pref_count > 0:
             generated_any = True
-            print(f"\n✅ 共生成 {len(pref_items)} 条 Preference 原始样本")
-            _preview_preference(pref_items)
-            pref_records = to_preference_format(pref_items, manager)
-            pref_path = output_dir / f"{novel_name}_preference.jsonl"
-            save_jsonl(pref_records, pref_path)
+            print(f"\n✅ 共生成 {pref_count} 条 Preference 样本，已写入 {pref_path}")
+            if first_pref_item:
+                _preview_preference([first_pref_item])
         else:
             print("⚠️ 没有生成任何 Preference 样本，请检查角色状态是否包含 unknown_facts")
 

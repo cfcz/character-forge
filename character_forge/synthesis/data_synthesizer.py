@@ -128,6 +128,35 @@ INDUCING_QUESTIONS_PROMPT = """\
 只输出 JSON 数组，例如：["问题1", "问题2", "问题3"]
 """
 
+BOUNDARY_CHECK_PROMPT = """\
+你是一个严格的裁判，负责判断角色扮演 AI 是否泄露了"不该知道的信息"。
+
+## 角色设定
+角色名：{name}
+当前时间点：第{chapter}章
+该角色此时尚不知情的信息（未知信息）：
+{unknown_fact}
+
+## 用户提问
+{question}
+
+## 模型回答
+{answer}
+
+## 判断任务
+请判断：模型的回答是否涉及或暗示了上面列出的"未知信息"？
+注意，暗示未知信息是指在回答中有对未知信息的倾向判断，或表明自己的看法和未知信息很大程度一致
+
+判断标准：
+- 如果回答明确提到了未知信息的内容 → 泄露
+- 如果回答用隐晦方式暗示了未知信息 → 泄露
+- 如果回答合理回避，或只说"不知道/不确定" → 未泄露
+- 如果问题与未知信息无关，回答正常 → 未泄露
+
+只输出 JSON：
+{{"leaked": true/false, "reason": "一句话说明原因"}}
+"""
+
 SFT_ANSWER_PROMPT = """\
 你是{name}，当前时间点是第{chapter}章。
 
@@ -413,22 +442,27 @@ class DataSynthesizer:
         characters: list[str] | None = None,
         max_chapters: int | None = None,
         max_samples: int | None = None,   # dry-run 用：凑够就停
-    ) -> list[StyleSFTItem]:
+    ):
+        """生成 SFT 样本，逐条 yield，支持调用方实时写入。"""
         chapters = split_chapters(novel_text)
         chapter_map = {ch.index: ch for ch in chapters}
         total_chapters = self._get_total_chapters(manager, max_chapters)
         target_chars = characters or manager.list_characters()
 
-        all_items: list[StyleSFTItem] = []
+        count = 0
         for char_name in target_chars:
-            if max_samples and len(all_items) >= max_samples:
+            if max_samples and count >= max_samples:
                 break
             print(f"\n🎭 [SFT] 处理角色：{char_name}")
-            remaining = (max_samples - len(all_items)) if max_samples else None
-            items = self._synthesize_sft_character(char_name, manager, chapter_map, total_chapters, max_samples=remaining)
-            all_items.extend(items)
-            print(f"   ✅ 生成 {len(items)} 条 SFT 样本")
-        return all_items[:max_samples] if max_samples else all_items
+            char_count = 0
+            remaining = (max_samples - count) if max_samples else None
+            for item in self._synthesize_sft_character(char_name, manager, chapter_map, total_chapters, max_samples=remaining):
+                yield item
+                count += 1
+                char_count += 1
+                if max_samples and count >= max_samples:
+                    break
+            print(f"   ✅ 生成 {char_count} 条 SFT 样本")
 
     def synthesize_preference(
         self,
@@ -437,22 +471,27 @@ class DataSynthesizer:
         characters: list[str] | None = None,
         max_chapters: int | None = None,
         max_samples: int | None = None,   # dry-run 用：凑够就停
-    ) -> list[PreferenceItem]:
+    ):
+        """生成 Preference 样本，逐条 yield，支持调用方实时写入。"""
         chapters = split_chapters(novel_text)
         chapter_map = {ch.index: ch for ch in chapters}
         total_chapters = self._get_total_chapters(manager, max_chapters)
         target_chars = characters or manager.list_characters()
 
-        all_items: list[PreferenceItem] = []
+        count = 0
         for char_name in target_chars:
-            if max_samples and len(all_items) >= max_samples:
+            if max_samples and count >= max_samples:
                 break
             print(f"\n🎭 [Preference] 处理角色：{char_name}")
-            remaining = (max_samples - len(all_items)) if max_samples else None
-            items = self._synthesize_preference_character(char_name, manager, chapter_map, total_chapters, max_samples=remaining)
-            all_items.extend(items)
-            print(f"   ✅ 生成 {len(items)} 条 Preference 样本")
-        return all_items[:max_samples] if max_samples else all_items
+            char_count = 0
+            remaining = (max_samples - count) if max_samples else None
+            for item in self._synthesize_preference_character(char_name, manager, chapter_map, total_chapters, max_samples=remaining):
+                yield item
+                count += 1
+                char_count += 1
+                if max_samples and count >= max_samples:
+                    break
+            print(f"   ✅ 生成 {char_count} 条 Preference 样本")
 
     def _get_total_chapters(
         self,
@@ -478,12 +517,11 @@ class DataSynthesizer:
         chapter_map: dict[int, Chapter],
         total_chapters: int,
         max_samples: int | None = None,
-    ) -> list[StyleSFTItem]:
-        items: list[StyleSFTItem] = []
-
-        last_state_chapter = -1  # 记录上一个切片的 state.chapter，避免重复处理
+    ):
+        count = 0
+        last_state_chapter = -1
         for chapter_idx in self._build_checkpoints(total_chapters):
-            if max_samples and len(items) >= max_samples:
+            if max_samples and count >= max_samples:
                 break
             state = manager.get_state_at_chapter(name, chapter_idx)
             if state is None:
@@ -492,7 +530,6 @@ class DataSynthesizer:
             if not self._has_sft_material(state):
                 print(f"   第{chapter_idx}章：缺少 SFT 素材，跳过")
                 continue
-            # 跳过状态没有变化的切片（角色在这段时间没出现在 character_changes 里）
             if state.chapter == last_state_chapter:
                 print(f"   第{chapter_idx}章：状态未更新（截止第{state.chapter}章），跳过")
                 continue
@@ -509,20 +546,20 @@ class DataSynthesizer:
                 continue
 
             for question in questions:
-                if max_samples and len(items) >= max_samples:
+                if max_samples and count >= max_samples:
                     break
                 try:
                     answer = self._generate_sft_answer(name, chapter_idx, state, few_shot, question)
-                    items.append(StyleSFTItem(
+                    yield StyleSFTItem(
                         character=name,
                         chapter=chapter_idx,
                         question=question,
                         answer=answer,
                         few_shot=few_shot,
-                    ))
+                    )
+                    count += 1
                 except Exception as e:
                     print(f"   ⚠️ SFT 样本生成失败（{name} 第{chapter_idx}章）: {e}")
-        return items
 
     def _synthesize_preference_character(
         self,
@@ -531,12 +568,11 @@ class DataSynthesizer:
         chapter_map: dict[int, Chapter],
         total_chapters: int,
         max_samples: int | None = None,
-    ) -> list[PreferenceItem]:
-        items: list[PreferenceItem] = []
-
+    ):
+        count = 0
         last_state_chapter = -1
         for chapter_idx in self._build_checkpoints(total_chapters):
-            if max_samples and len(items) >= max_samples:
+            if max_samples and count >= max_samples:
                 break
             state = manager.get_state_at_chapter(name, chapter_idx)
             if state is None or not state.unknown_facts:
@@ -555,31 +591,23 @@ class DataSynthesizer:
             print(f"   第{chapter_idx}章：{len(state.unknown_facts)} 条 unknown_facts")
 
             for fact in state.unknown_facts:
-                if max_samples and len(items) >= max_samples:
+                if max_samples and count >= max_samples:
                     break
                 try:
                     questions = self._generate_preference_questions(name, chapter_idx, fact)
                     for question in questions:
-                        if max_samples and len(items) >= max_samples:
+                        if max_samples and count >= max_samples:
                             break
-                        chosen = self._generate_preference_chosen(
-                            name, chapter_idx, state, few_shot, question
-                        )
-                        rejected = self._generate_preference_rejected(
+                        item = self._generate_preference_item_with_boundary_check(
                             name, chapter_idx, state, few_shot, question, fact
                         )
-                        items.append(PreferenceItem(
-                            character=name,
-                            chapter=chapter_idx,
-                            unknown_fact=fact,
-                            question=question,
-                            chosen=chosen,
-                            rejected=rejected,
-                            few_shot=few_shot,
-                        ))
+                        if item is not None:
+                            yield item
+                            count += 1
+                        else:
+                            print(f"   ⚠️ chosen 多次重试仍泄露，丢弃此样本（{name} 第{chapter_idx}章）")
                 except Exception as e:
                     print(f"   ⚠️ Preference 样本生成失败（{name} 第{chapter_idx}章）: {e}")
-        return items
 
     def _has_sft_material(self, state: CharacterState) -> bool:
         # 至少要有一定量的已知信息或关键记忆，否则生成的回答天花板太低
@@ -751,17 +779,15 @@ class DataSynthesizer:
         combined = "\n\n---\n\n".join(content_parts)
 
         # ── 第一步：正则抽取 ────────────────────────────────────────────────
-        # strict  = 有明确"{name}+说话动词"证据
-        # ambiguous = 无任何说话人归属（代词叙述或省略主语的对话）
+        # strict     = 有明确"{name}+说话动词"证据的引号内容
+        # ambiguous  = 无任何说话人明确归属的引号（代词叙述或省略主语）
+        # 注意：strict 并不等于"一定正确"——正则窗口内可能跨越其他角色名，
+        #       因此 strict 也必须走 LLM 验证，不能提前 return。
         strict_lines, ambiguous_lines = _extract_dialogues_by_speaker(
             name, combined, self.dialogue_examples
         )
-        if len(strict_lines) >= min(4, self.dialogue_examples):
-            result = "\n".join(strict_lines[:self.dialogue_examples])
-            self._dialogue_cache[cache_key] = result
-            return result
 
-        # ── 第二步：LLM 生成候选（与 ambiguous 合并后逐条验证）───────────
+        # ── 第二步：LLM 生成候选 ────────────────────────────────────────────
         llm_lines: list[str] = []
         try:
             prompt = DIALOGUE_EXTRACT_PROMPT.format(
@@ -776,14 +802,14 @@ class DataSynthesizer:
         except Exception as e:
             print(f"   ⚠️ LLM 台词生成失败: {e}")
 
-        # ambiguous 候选 + LLM 生成候选合并，逐条 LLM 验证（用段落上下文）
-        candidates = _dedupe_keep_order(ambiguous_lines + llm_lines)
+        # ── 第三步：strict + ambiguous + LLM 候选全部统一走 LLM 验证 ────────
+        # strict 优先放前面，验证通过率高，顺序靠前使最终 slice 优先取到
+        candidates = _dedupe_keep_order(strict_lines + ambiguous_lines + llm_lines)
         try:
             validated = self._validate_dialogues_with_llm(name, candidates, combined)
-            merged = _dedupe_keep_order(strict_lines + validated)[:self.dialogue_examples]
-            result = "\n".join(merged) if merged else fallback
+            result = "\n".join(validated[:self.dialogue_examples]) if validated else fallback
         except Exception as e:
-            print(f"   ⚠️ 台词验证失败: {e}")
+            print(f"   ⚠️ 台词验证失败，回退到正则 strict 结果: {e}")
             result = "\n".join(strict_lines[:self.dialogue_examples]) if strict_lines else fallback
 
         self._dialogue_cache[cache_key] = result
@@ -990,6 +1016,89 @@ class DataSynthesizer:
             unknown_fact=unknown_fact,
         )
         return self._generate_answer_with_retry(prompt, base_temperature=0.6, state=state)
+
+    def _check_boundary_leaked(
+        self, name: str, chapter: int, question: str, answer: str, unknown_fact: str
+    ) -> bool:
+        """
+        用 LLM 判断 answer 是否泄露了 unknown_fact。
+        与 evaluate.py 的 BOUNDARY_JUDGE_PROMPT 保持一致。
+        返回 True 表示泄露，False 表示守住边界。
+        判断失败时保守返回 False（不丢弃数据）。
+        """
+        prompt = BOUNDARY_CHECK_PROMPT.format(
+            name=name,
+            chapter=chapter,
+            question=question,
+            unknown_fact=unknown_fact,
+            answer=answer,
+        )
+        try:
+            result = self.llm.generate_json(prompt, temperature=0.0)
+            return bool(result.get("leaked", False))
+        except Exception as e:
+            print(f"   ⚠️ boundary check 失败，保守判为未泄露: {e}")
+            return False
+
+    def _generate_preference_item_with_boundary_check(
+        self,
+        name: str,
+        chapter: int,
+        state: CharacterState,
+        few_shot: str,
+        question: str,
+        unknown_fact: str,
+        max_retries: int = 2,
+    ) -> "PreferenceItem | None":
+        """
+        生成一条 preference 样本，并确保 chosen 不泄露 unknown_fact。
+
+        流程：
+          1. 生成 chosen 候选
+          2. 用 boundary check（与 evaluate.py 标准一致）检测是否泄露
+          3. 泄露 → 该候选直接作为 rejected（天然是泄露版本），重新生成 chosen
+          4. chosen 通过后：
+             - 若之前已有泄露候选 → 用第一个泄露候选作 rejected（不再另外生成）
+             - 若一次就通过（无泄露候选）→ 另外生成 rejected
+          5. 所有重试均泄露 → 返回 None，调用方丢弃此样本
+        """
+        leaked_candidate: str | None = None  # 保存第一个泄露候选，直接用作 rejected
+
+        for attempt in range(max_retries):
+            chosen_candidate = self._generate_preference_chosen(
+                name, chapter, state, few_shot, question
+            )
+            leaked = self._check_boundary_leaked(
+                name, chapter, question, chosen_candidate, unknown_fact
+            )
+
+            if not leaked:
+                if attempt > 0:
+                    print(f"   🔄 chosen 第{attempt+1}次重试通过边界检测")
+                # 优先用之前泄露的候选作 rejected（语义更自然），否则另外生成
+                if leaked_candidate is not None:
+                    rejected = leaked_candidate
+                else:
+                    rejected = self._generate_preference_rejected(
+                        name, chapter, state, few_shot, question, unknown_fact
+                    )
+                return PreferenceItem(
+                    character=name,
+                    chapter=chapter,
+                    unknown_fact=unknown_fact,
+                    question=question,
+                    chosen=chosen_candidate,
+                    rejected=rejected,
+                    few_shot=few_shot,
+                )
+            else:
+                # chosen 泄露 → 保存为 rejected 候选，重新生成
+                print(f"   ⚠️ chosen 泄露（第{attempt+1}次），保存为 rejected 候选，重新生成 chosen...")
+                if leaked_candidate is None:
+                    leaked_candidate = chosen_candidate  # 只保留第一个，风格最自然
+
+        # 所有重试均泄露，丢弃此样本
+        return None
 
 
 # ── 输出格式化 ────────────────────────────────────────────────────────────────
